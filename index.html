@@ -865,31 +865,32 @@ function localRankList(tab){
 }
 
 function mergeRank(remote, tab){
-  /* 曾用名的线上成绩并到当前名字，仍算作“我” */
+  /* 1) 曾用名的线上成绩统一改成当前名字 */
   var al = (state.aliases || []);
-  var cur = -1;
-  for(var i=remote.length-1;i>=0;i--){
-    var nm = remote[i].name;
-    if(nm === state.name){ cur = i; continue; }
-    if(al.indexOf(nm) < 0) continue;
-    if(cur < 0){
-      remote[i].name = state.name;
-      cur = i;
-    }else{
-      var keep = remote[cur], gone = remote[i];
-      if(gone.level > keep.level || (gone.level === keep.level && gone.score > keep.score)){
-        keep.level = gone.level; keep.score = gone.score; keep.avatar = gone.avatar;
+  for(var i=0;i<remote.length;i++){
+    if(remote[i].name !== state.name && al.indexOf(remote[i].name) >= 0) remote[i].name = state.name;
+  }
+  /* 2) 同名（含改名后重合的）只留最好的一条 */
+  var map = {}, out = [];
+  for(var i=0;i<remote.length;i++){
+    var r = remote[i], k = String(r.name || "").trim();
+    if(!k) continue;
+    if(!map[k]){ map[k] = { name:k, avatar:r.avatar, level:r.level, score:r.score }; out.push(map[k]); }
+    else{
+      var keep = map[k];
+      if(r.level > keep.level || (r.level === keep.level && r.score > keep.score)){
+        keep.level = r.level; keep.score = r.score;
+        if(r.avatar) keep.avatar = r.avatar;
       }
-      remote.splice(i,1);
-      if(i < cur) cur--;
     }
   }
+  remote = out;
+  /* 3) 我自己的头像以本机设置为准 */
   var mine = localRankList(tab)[0];
   var has = false;
   for(var i=0;i<remote.length;i++){
     if(remote[i].name === state.name){
       has = true;
-      /* 我自己的头像以本机设置为准，避免云端旧行还是默认咪菇 */
       if(state.avatar) remote[i].avatar = rankAvatar(state.avatar);
       break;
     }
