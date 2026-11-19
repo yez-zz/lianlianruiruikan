@@ -307,7 +307,8 @@ function avatarHTML(cls){
   if(a.indexOf("emoji:") === 0){
     return '<div class="avatar ' + (cls||'') + ' avatarEmoji">' + a.slice(6) + '</div>';
   }
-  return '<img class="avatar ' + (cls||'') + '" src="' + a + '" alt="头像">';
+  /* 图片坏了（本地存储里的头像被截断/失效）自动退回默认咪菇头像 */
+  return '<img class="avatar ' + (cls||'') + '" src="' + a + '" alt="头像" onerror="this.onerror=null;this.src=DEFAULT_AVATAR;">';
 }
 function refreshUserUI(){
   document.getElementById("startName").textContent = state.name;
@@ -607,17 +608,27 @@ function importCode(){
 }
 
 /* ---------------- 排行榜（仅本机真实记录） ---------------- */
-function sbReq(path, opt){
+function sbReq(path, opt, timeoutMs){
   opt = opt || {};
-  var headers = { "apikey": SB_KEY, "Authorization": "Bearer " + SB_KEY, "Content-Type": "application/json" };
-  if(opt.headers){ for(var k in opt.headers) headers[k] = opt.headers[k]; }
-  return fetch(SB_URL + "/rest/v1/" + path, {
-    method: opt.method || "GET",
-    headers: headers,
-    body: opt.body
-  }).then(function(r){
+  /* key 走网址参数，不发自定义请求头——很多手机内置浏览器会拦掉预检请求 */
+  var url = SB_URL + "/rest/v1/" + path + (path.indexOf("?") >= 0 ? "&" : "?") + "apikey=" + encodeURIComponent(SB_KEY);
+  var headers = {};
+  if(opt.body){ headers["Content-Type"] = "application/json"; }
+  var opts = { method: opt.method || "GET", headers: headers, body: opt.body };
+  if(opt.headers){ for(var k in opt.headers){ headers[k] = opt.headers[k]; } }
+  var ctrl = null, timer = null;
+  try{ if(typeof AbortController !== "undefined"){ ctrl = new AbortController(); opts.signal = ctrl.signal; } }catch(e){}
+  var req = fetch(url, opts);
+  if(ctrl){
+    timer = setTimeout(function(){ try{ ctrl.abort(); }catch(e){} }, timeoutMs || 9000);
+  }
+  return req.then(function(r){
+    if(timer){ clearTimeout(timer); timer = null; }
     if(!r.ok) throw new Error("HTTP " + r.status);
     return r.json();
+  }, function(e){
+    if(timer){ clearTimeout(timer); timer = null; }
+    throw e;
   });
 }
 
@@ -628,12 +639,40 @@ function rankAvatar(av){
 
 function submitScore(mode, level, score){
   if(!level || level < 1) return;
+  var body = JSON.stringify([{ mode: mode, name: state.name, avatar: rankAvatar(state.avatar), level: level, score: score }]);
   try{
-    sbReq("llr_scores", {
+    sbReq("llr_scores?select=id", {
       method: "POST",
-      headers: { "Prefer": "return=minimal" },
-      body: JSON.stringify([{ mode: mode, name: state.name, avatar: rankAvatar(state.avatar), level: level, score: score }])
-    }).catch(function(){});
+      body: body
+    }).catch(function(){
+      pushPending(body);
+    });
+  }catch(e){
+    pushPending(body);
+  }
+}
+
+function pushPending(body){
+  try{
+    var q = [];
+    try{ q = JSON.parse(localStorage.getItem("llr_pending") || "[]") || []; }catch(e){ q = []; }
+    if(q.length > 20) q = q.slice(q.length - 20);
+    q.push(body);
+    localStorage.setItem("llr_pending", JSON.stringify(q));
+  }catch(e){}
+}
+
+function flushPending(){
+  try{
+    var q = [];
+    try{ q = JSON.parse(localStorage.getItem("llr_pending") || "[]") || []; }catch(e){ q = []; }
+    if(!q.length) return;
+    localStorage.setItem("llr_pending", "[]");
+    q.forEach(function(body){
+      try{
+        sbReq("llr_scores?select=id", { method: "POST", body: body }).catch(function(){ pushPending(body); });
+      }catch(e){ pushPending(body); }
+    });
   }catch(e){}
 }
 
@@ -682,6 +721,7 @@ function recordResult(level, score, timeUsed){
 }
 function openRank(tab){
   tab = (tab === "challenge") ? "challenge" : "normal";
+  curRankTab = tab;
   var isCh = tab === "challenge";
   var html = '<div class="modalTitle">🏆 排行榜</div>';
   html += '<div class="rankTabs">';
@@ -693,16 +733,76 @@ function openRank(tab){
   html += '<div class="modalBtns"><button class="mBtn" onclick="closeModal()">关闭</button></div>';
   openModal(html);
   renderRankLocal(tab);
-  fetchScores(tab, function(err, rows){
+  loadRemoteRank(tab, 2, function(rows, fromCache, agoMs){
     if(!document.getElementById("rankBody")) return;
-    if(!err){ renderRankList(tab, mergeRank(dedupeScores(rows), tab), true); return; }
-    setTimeout(function(){
-      fetchScores(tab, function(err2, rows2){
-        if(!document.getElementById("rankBody")) return;
-        if(err2) renderRankLocal(tab);
-        else renderRankList(tab, mergeRank(dedupeScores(rows2), tab), true);
-      });
-    }, 1500);
+    if(rows){
+      if(!fromCache) flushPending();
+      renderRankList(tab, mergeRank(dedupeScores(rows), tab), true,
+        fromCache ? ('☁️ 上次连上云的成绩（' + agoText(agoMs) + '），联网后自动更新。') : null, false);
+    }else{
+      renderRankLocal(tab, true, lastRankErr);
+    }
+  });
+}
+
+function agoText(ms){
+  var min = Math.floor((ms || 0) / 60000);
+  if(min < 1) return "刚刚";
+  if(min < 60) return min + " 分钟前";
+  var h = Math.floor(min / 60);
+  if(h < 24) return h + " 小时前";
+  return Math.floor(h / 24) + " 天前";
+}
+
+function rankCacheKey(mode){ return "llr_rank_cache_" + mode; }
+
+function saveRankCache(mode, rows){
+  try{ localStorage.setItem(rankCacheKey(mode), JSON.stringify({ t: Date.now(), rows: rows })); }catch(e){}
+}
+
+function readRankCache(mode){
+  try{
+    var raw = localStorage.getItem(rankCacheKey(mode));
+    if(!raw) return null;
+    var o = JSON.parse(raw);
+    if(!o || !o.rows) return null;
+    return o;
+  }catch(e){ return null; }
+}
+
+function loadRemoteRank(mode, tries, cb){
+  var delays = [1200, 3000];
+  (function attempt(n){
+    fetchScores(mode, function(err, rows){
+      if(!err){ lastRankErr = null; saveRankCache(mode, rows || []); cb(rows || [], false, 0); return; }
+      if(n > 0){
+        var d = delays[Math.min(delays.length - 1, 2 - n)] || 2000;
+        setTimeout(function(){ attempt(n - 1); }, d);
+        return;
+      }
+      lastRankErr = (err && (err.message || String(err))) || "网络错误";
+      var c = readRankCache(mode);
+      if(c) cb(c.rows, true, Date.now() - (c.t || 0), lastRankErr);
+      else cb(null, false, 0, lastRankErr);
+    });
+  })(tries);
+}
+
+var curRankTab = "normal";
+var lastRankErr = null;
+function retryRank(){
+  var body = document.getElementById("rankBody");
+  var src = document.getElementById("rankSrc");
+  if(body) body.innerHTML = '<div class="emptyTip">正在重新连线上榜…</div>';
+  if(src) src.textContent = "正在连线上榜…";
+  loadRemoteRank(curRankTab, 2, function(rows, fromCache, agoMs){
+    if(!document.getElementById("rankBody")) return;
+    if(rows){
+      renderRankList(curRankTab, mergeRank(dedupeScores(rows), curRankTab), true,
+        fromCache ? ('☁️ 上次连上云的成绩（' + agoText(agoMs) + '），联网后自动更新。') : null, false);
+    }else{
+      renderRankLocal(curRankTab, true, lastRankErr);
+    }
   });
 }
 
@@ -722,17 +822,22 @@ function mergeRank(remote, tab){
   return remote;
 }
 
-function renderRankLocal(tab){
-  renderRankList(tab, localRankList(tab), false);
+function renderRankLocal(tab, canRetry, errMsg){
+  var text = null;
+  if(errMsg) text = '📱 暂时连不上云（' + errMsg + '），先显示这台设备上的真实成绩。';
+  renderRankList(tab, localRankList(tab), false, text, !!canRetry);
 }
 
-function renderRankList(tab, list, online){
+function renderRankList(tab, list, online, srcOverride, canRetry){
   var isCh = tab === "challenge";
   var body = document.getElementById("rankBody");
   if(!body) return;
   var html = '';
   var src = document.getElementById("rankSrc");
-  if(src) src.textContent = online ? '☁️ 线上共享榜：所有人真实玩出来的成绩，不含虚拟玩家。' : '📱 暂时连不上云，先显示这台设备上的真实成绩。';
+  if(src){
+    if(srcOverride != null) src.textContent = srcOverride;
+    else src.textContent = online ? '☁️ 线上共享榜：所有人真实玩出来的成绩，不含虚拟玩家。' : '📱 暂时连不上云，先显示这台设备上的真实成绩。';
+  }
   if(!list.length){
     html += '<div class="emptyTip">' + (isCh ? '还没有挑战记录~<br>去挑战模式连打通关试试吧！' : '还没有成绩记录~<br>快去闯关登上排行榜吧！') + '</div>';
   }else{
@@ -745,7 +850,7 @@ function renderRankList(tab, list, online){
         av = '<div class="avatar avatarEmoji">' + it.avatar.slice(6) + '</div>';
       }else{
         var srcImg = (it.avatar && it.avatar.indexOf("data:") === 0) ? it.avatar : DEFAULT_AVATAR;
-        av = '<img class="avatar" src="' + srcImg + '">';
+        av = '<img class="avatar" src="' + srcImg + '" onerror="this.onerror=null;this.src=DEFAULT_AVATAR;">';
       }
       html += '<div class="rankRow' + (isMe ? ' me' : '') + '">';
       html += '<div class="rankNo ' + noCls + '">' + (i + 1) + '</div>';
@@ -755,6 +860,9 @@ function renderRankList(tab, list, online){
       html += '<div class="rankScore">' + it.score + '</div>';
       html += '</div>';
     }
+  }
+  if(canRetry){
+    html += '<button onclick="retryRank()" style="margin:10px auto 2px;display:block;width:60%;padding:9px 0;border:none;border-radius:12px;background:#e9f6e9;border:1.5px solid #b9dfb9;color:#3d7a45;font-size:13px;font-weight:700;cursor:pointer">↻ 重新连线上榜</button>';
   }
   body.innerHTML = html;
 }
@@ -1154,25 +1262,93 @@ function lineEmpty(r1, c1, r2, c2){
   }
   return false;
 }
-function canLink(a, b){
-  if(a.r === b.r && lineEmpty(a.r, a.c, b.r, b.c)) return true;
-  if(a.c === b.c && lineEmpty(a.r, a.c, b.r, b.c)) return true;
+function linkPath(a, b){
+  if(a.r === b.r && lineEmpty(a.r, a.c, b.r, b.c)) return [a, b];
+  if(a.c === b.c && lineEmpty(a.r, a.c, b.r, b.c)) return [a, b];
   // 一个折点
-  if(!occupied(a.r, b.c) && lineEmpty(a.r, a.c, a.r, b.c) && lineEmpty(a.r, b.c, b.r, b.c)) return true;
-  if(!occupied(b.r, a.c) && lineEmpty(a.r, a.c, b.r, a.c) && lineEmpty(b.r, a.c, b.r, b.c)) return true;
+  if(!occupied(a.r, b.c) && lineEmpty(a.r, a.c, a.r, b.c) && lineEmpty(a.r, b.c, b.r, b.c)) return [a, {r:a.r, c:b.c}, b];
+  if(!occupied(b.r, a.c) && lineEmpty(a.r, a.c, b.r, a.c) && lineEmpty(b.r, a.c, b.r, b.c)) return [a, {r:b.r, c:a.c}, b];
   // 两个折点：按行扫描
   for(var r=-1;r<=ROWS;r++){
     if(r === a.r || r === b.r) continue;
     if(occupied(r, a.c) || occupied(r, b.c)) continue;
-    if(lineEmpty(a.r, a.c, r, a.c) && lineEmpty(r, a.c, r, b.c) && lineEmpty(r, b.c, b.r, b.c)) return true;
+    if(lineEmpty(a.r, a.c, r, a.c) && lineEmpty(r, a.c, r, b.c) && lineEmpty(r, b.c, b.r, b.c)){
+      return [a, {r:r, c:a.c}, {r:r, c:b.c}, b];
+    }
   }
   // 两个折点：按列扫描
   for(var c=-1;c<=COLS;c++){
     if(c === a.c || c === b.c) continue;
     if(occupied(a.r, c) || occupied(b.r, c)) continue;
-    if(lineEmpty(a.r, a.c, a.r, c) && lineEmpty(a.r, c, b.r, c) && lineEmpty(b.r, c, b.r, b.c)) return true;
+    if(lineEmpty(a.r, a.c, a.r, c) && lineEmpty(a.r, c, b.r, c) && lineEmpty(b.r, c, b.r, b.c)){
+      return [a, {r:a.r, c:c}, {r:b.r, c:c}, b];
+    }
   }
-  return false;
+  return null;
+}
+function canLink(a, b){
+  return !!linkPath(a, b);
+}
+
+/* 画出两格之间的连线（绿色，短暂闪现后淡出） */
+var LINK_M = 18;
+function drawLinkPath(pts){
+  if(!pts || pts.length < 2) return;
+  var board = document.getElementById("board");
+  if(!board || !cellSize) return;
+  var w = COLS * cellSize + (COLS - 1) * GAP;
+  var h = ROWS * cellSize + (ROWS - 1) * GAP;
+  var cv = document.getElementById("linkCanvas");
+  if(!cv){
+    cv = document.createElement("canvas");
+    cv.id = "linkCanvas";
+    cv.style.position = "absolute";
+    cv.style.pointerEvents = "none";
+    cv.style.zIndex = "40";
+    cv.style.transition = "opacity .32s";
+    board.appendChild(cv);
+  }
+  var M = Math.round(cellSize / 2 + GAP + 10);   // 留出棋盘外的绕行空间（-1 行/-1 列）
+  var dpr = Math.min(2.5, window.devicePixelRatio || 1);
+  cv.style.left = (-M) + "px";
+  cv.style.top = (-M) + "px";
+  cv.style.width = (w + M * 2) + "px";
+  cv.style.height = (h + M * 2) + "px";
+  cv.width = Math.round((w + M * 2) * dpr);
+  cv.height = Math.round((h + M * 2) * dpr);
+  var ctx = cv.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w + M * 2, h + M * 2);
+  ctx.lineWidth = 4;
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  ctx.strokeStyle = "rgba(87,181,68,.96)";
+  ctx.shadowColor = "rgba(87,181,68,.5)";
+  ctx.shadowBlur = 8;
+  var pass = [["rgba(255,255,255,.95)", 8], ["rgba(87,181,68,.96)", 4]];
+  for(var k=0;k<pass.length;k++){
+    ctx.lineWidth = pass[k][1];
+    ctx.strokeStyle = pass[k][0];
+    ctx.beginPath();
+    for(var i=0;i<pts.length;i++){
+      var p = pts[i];
+      var x = M + p.c * (cellSize + GAP) + cellSize / 2;
+      var y = M + p.r * (cellSize + GAP) + cellSize / 2;
+      if(i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  }
+  cv.style.opacity = "1";
+  if(cv._t1) clearTimeout(cv._t1);
+  if(cv._t2) clearTimeout(cv._t2);
+  cv._t1 = setTimeout(function(){ if(cv) cv.style.opacity = "0"; }, 230);
+  cv._t2 = setTimeout(function(){
+    try{
+      var c2 = cv.getContext("2d");
+      c2.setTransform(1, 0, 0, 1, 0, 0);
+      c2.clearRect(0, 0, cv.width, cv.height);
+    }catch(e){}
+  }, 700);
 }
 
 function findPair(){
@@ -1273,6 +1449,7 @@ function onTileClick(r, c, el){
     return;
   }
   // 成功消除
+  drawLinkPath(linkPath({r:first.r, c:first.c}, {r:r, c:c}));
   first.el.classList.remove("sel");
   first.el.classList.add("gone");
   el.classList.add("gone");
