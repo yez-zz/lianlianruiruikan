@@ -751,7 +751,13 @@ function openRank(tab){
   html += '<div class="warnTip">' + (isCh ? '挑战模式：18 关连打，三颗心全程共用、不给提示和重排。' : '闯关模式：逐关解锁，每关独立三条命。') + '<br><span id="rankSrc">正在连线上榜…</span></div>';
   html += '<div class="modalBtns"><button class="mBtn" onclick="closeModal()">关闭</button></div>';
   openModal(html);
-  renderRankLocal(tab);
+  var cached = readRankCache(tab);
+  if(cached && cached.rows && cached.rows.length){
+    renderRankList(tab, mergeRank(dedupeScores(cached.rows), tab), true,
+      '⏳ 正在连线上榜…（先显示上次同步的云端成绩）', false);
+  }else{
+    renderRankLocal(tab, false, null, true);
+  }
   loadRemoteRank(tab, 2, function(rows, fromCache, agoMs){
     if(!document.getElementById("rankBody")) return;
     if(rows){
@@ -860,9 +866,10 @@ function mergeRank(remote, tab){
   return remote;
 }
 
-function renderRankLocal(tab, canRetry, errMsg){
+function renderRankLocal(tab, canRetry, errMsg, loading){
   var text = null;
   if(errMsg) text = '📱 暂时连不上云（' + errMsg + '），先显示这台设备上的真实成绩。';
+  else if(loading) text = '⏳ 正在连线上榜…先显示这台设备上的成绩。';
   renderRankList(tab, localRankList(tab), false, text, !!canRetry);
 }
 
