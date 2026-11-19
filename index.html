@@ -269,9 +269,12 @@ var LEVEL_COUNT = LEVELS.length;
 var STORE_KEY = "llr_save_v1";
 var state = null;
 
+function randomName(){
+  return "爱瑞瑞" + (1000 + Math.floor(Math.random() * 9000));
+}
 function defaultState(){
   return {
-    name: "爱瑞瑞",
+    name: randomName(),
     avatar: DEFAULT_AVATAR,
     unlocked: 1,
     stars: {},
