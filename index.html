@@ -303,9 +303,15 @@ function loadState(){
     if(!Array.isArray(o.chRecords)) o.chRecords = [];
     /* 老版本默认名都是同一个「爱瑞瑞」，导致所有人看起来都是同一人，这里迁移成随机名 */
     if(o.name === "爱瑞瑞"){
+      var oldNm = o.name;
       o.name = randomName();
       if(!o.aliases) o.aliases = [];
-      if(o.aliases.indexOf("爱瑞瑞") < 0) o.aliases.push("爱瑞瑞");
+      if(o.aliases.indexOf(oldNm) < 0) o.aliases.push(oldNm);
+      /* 本机旧成绩也要跟着换名字，否则榜上还会出现“爱瑞瑞（我）” */
+      [o.records, o.chRecords].forEach(function(list){
+        if(!list) return;
+        for(var i=0;i<list.length;i++){ if(list[i] && list[i].name === oldNm) list[i].name = o.name; }
+      });
     }
     return o;
   }catch(e){ return defaultState(); }
@@ -979,7 +985,7 @@ function mergeRank(remote, tab){
       break;
     }
   }
-  if(mine && !has) remote.push({ name: mine.name, uid: myUid, avatar: mine.avatar, level: mine.level, score: mine.score });
+  if(mine && !has) remote.push({ name: state.name, uid: myUid, avatar: mine.avatar, level: mine.level, score: mine.score });
   remote.sort(function(a,b){ if(b.level !== a.level) return b.level - a.level; return b.score - a.score; });
   return remote;
 }
