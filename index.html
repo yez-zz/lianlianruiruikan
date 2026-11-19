@@ -279,7 +279,8 @@ function defaultState(){
     sound: true,
     music: true,
     records: [],
-    chRecords: []
+    chRecords: [],
+    aliases: []
   };
 }
 
@@ -533,7 +534,22 @@ function handleAvatarFile(input){
 }
 function saveProfile(){
   var nm = document.getElementById("nameInp").value.trim();
-  if(nm) state.name = nm;
+  if(nm && nm !== state.name){
+    var oldName = state.name;
+    if(!state.aliases) state.aliases = [];
+    if(oldName && state.aliases.indexOf(oldName) < 0){
+      state.aliases.push(oldName);
+      if(state.aliases.length > 5) state.aliases = state.aliases.slice(-5);
+    }
+    /* 本机记录直接改到新名字，避免自己出现两行 */
+    [state.records, state.chRecords].forEach(function(list){
+      if(!list) return;
+      for(var i=0;i<list.length;i++){ if(list[i].name === oldName) list[i].name = nm; }
+    });
+    state.name = nm;
+  }else if(nm){
+    state.name = nm;
+  }
   if(pendingAvatar) state.avatar = pendingAvatar;
   saveState();
   refreshUserUI();
@@ -814,6 +830,25 @@ function localRankList(tab){
 }
 
 function mergeRank(remote, tab){
+  /* 曾用名的线上成绩并到当前名字，仍算作“我” */
+  var al = (state.aliases || []);
+  var cur = -1;
+  for(var i=remote.length-1;i>=0;i--){
+    var nm = remote[i].name;
+    if(nm === state.name){ cur = i; continue; }
+    if(al.indexOf(nm) < 0) continue;
+    if(cur < 0){
+      remote[i].name = state.name;
+      cur = i;
+    }else{
+      var keep = remote[cur], gone = remote[i];
+      if(gone.level > keep.level || (gone.level === keep.level && gone.score > keep.score)){
+        keep.level = gone.level; keep.score = gone.score; keep.avatar = gone.avatar;
+      }
+      remote.splice(i,1);
+      if(i < cur) cur--;
+    }
+  }
   var mine = localRankList(tab)[0];
   var has = false;
   for(var i=0;i<remote.length;i++){ if(remote[i].name === state.name){ has = true; break; } }
@@ -836,7 +871,7 @@ function renderRankList(tab, list, online, srcOverride, canRetry){
   var src = document.getElementById("rankSrc");
   if(src){
     if(srcOverride != null) src.textContent = srcOverride;
-    else src.textContent = online ? '☁️ 线上共享榜：所有人真实玩出来的成绩，不含虚拟玩家。' : '📱 暂时连不上云，先显示这台设备上的真实成绩。';
+    else src.textContent = online ? '☁️ 线上共享榜：所有人真实玩出来的成绩。' : '📱 暂时连不上云，先显示这台设备上的真实成绩。';
   }
   if(!list.length){
     html += '<div class="emptyTip">' + (isCh ? '还没有挑战记录~<br>去挑战模式连打通关试试吧！' : '还没有成绩记录~<br>快去闯关登上排行榜吧！') + '</div>';
@@ -844,7 +879,7 @@ function renderRankList(tab, list, online, srcOverride, canRetry){
     for(var i=0;i<list.length;i++){
       var it = list[i];
       var noCls = (i === 0 ? "top1" : i === 1 ? "top2" : i === 2 ? "top3" : "");
-      var isMe = (it.name === state.name);
+      var isMe = (it.name === state.name) || ((state.aliases || []).indexOf(it.name) >= 0);
       var av;
       if(it.avatar && it.avatar.indexOf("emoji:") === 0){
         av = '<div class="avatar avatarEmoji">' + it.avatar.slice(6) + '</div>';
