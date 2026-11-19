@@ -751,6 +751,15 @@ function openRank(tab){
   html += '<div class="warnTip">' + (isCh ? '挑战模式：18 关连打，三颗心全程共用、不给提示和重排。' : '闯关模式：逐关解锁，每关独立三条命。') + '<br><span id="rankSrc">正在连线上榜…</span></div>';
   html += '<div class="modalBtns"><button class="mBtn" onclick="closeModal()">关闭</button></div>';
   openModal(html);
+  if(rankMem[tab]){
+    /* 本次已成功拉过：先用这份，后台静默更新，失败也不动界面 */
+    renderRankList(tab, mergeRank(dedupeScores(rankMem[tab]), tab), true, null, false);
+    loadRemoteRank(tab, 0, function(rows){
+      if(!document.getElementById("rankBody")) return;
+      if(rows) renderRankList(tab, mergeRank(dedupeScores(rows), tab), true, null, false);
+    });
+    return;
+  }
   var cached = readRankCache(tab);
   if(cached && cached.rows && cached.rows.length){
     renderRankList(tab, mergeRank(dedupeScores(cached.rows), tab), true,
@@ -799,7 +808,13 @@ function loadRemoteRank(mode, tries, cb){
   var delays = [1200, 3000];
   (function attempt(n){
     fetchScores(mode, function(err, rows){
-      if(!err){ lastRankErr = null; saveRankCache(mode, rows || []); cb(rows || [], false, 0); return; }
+      if(!err){
+        lastRankErr = null;
+        rankMem[mode] = rows || [];
+        saveRankCache(mode, rows || []);
+        cb(rows || [], false, 0);
+        return;
+      }
       if(n > 0){
         var d = delays[Math.min(delays.length - 1, 2 - n)] || 2000;
         setTimeout(function(){ attempt(n - 1); }, d);
@@ -814,6 +829,7 @@ function loadRemoteRank(mode, tries, cb){
 }
 
 var curRankTab = "normal";
+var rankMem = {};
 var lastRankErr = null;
 function retryRank(){
   var body = document.getElementById("rankBody");
