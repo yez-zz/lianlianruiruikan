@@ -509,14 +509,14 @@ function handleAvatarFile(input){
   reader.onload = function(e){
     var img = new Image();
     img.onload = function(){
-      var size = 256;
+      var size = 200;
       var cv = document.createElement("canvas");
       cv.width = size; cv.height = size;
       var ctx = cv.getContext("2d");
       var side = Math.min(img.width, img.height);
       var sx = (img.width - side) / 2, sy = (img.height - side) / 2;
       ctx.drawImage(img, sx, sy, side, side, 0, 0, size, size);
-      var data = cv.toDataURL("image/jpeg", 0.82);
+      var data = cv.toDataURL("image/jpeg", 0.75);
       pendingAvatar = data;
       var grid = document.getElementById("avGrid");
       var ups = grid.querySelectorAll(".avOpt");
@@ -557,6 +557,10 @@ function saveProfile(){
   saveState();
   refreshUserUI();
   closeModal();
+  /* 换头像/改名后，把现有最好成绩重发一次，让云端那行也换成新头像 */
+  var bn = localRankList("normal")[0], bc = localRankList("challenge")[0];
+  if(bn && bn.level >= 1) submitScore("normal", bn.level, bn.score);
+  if(bc && bc.level >= 1) submitScore("challenge", bc.level, bc.score);
 }
 
 /* ---------------- 存档码 ---------------- */
@@ -652,7 +656,10 @@ function sbReq(path, opt, timeoutMs){
 }
 
 function rankAvatar(av){
-  if(av && av.indexOf("emoji:") === 0) return av;
+  if(!av) return "mascot";
+  if(av.indexOf("emoji:") === 0) return av;
+  /* 自定义上传头像：直接传压缩后的小图 dataURL，其他设备才看得到 */
+  if(av.indexOf("data:") === 0 && av !== DEFAULT_AVATAR) return av;
   return "mascot";
 }
 
@@ -850,6 +857,9 @@ function retryRank(){
 function localRankList(tab){
   var isCh = tab === "challenge";
   var list = (isCh ? (state.chRecords || []) : (state.records || [])).slice();
+  for(var i=0;i<list.length;i++){
+    if(list[i].name === state.name && state.avatar) list[i].avatar = rankAvatar(state.avatar);
+  }
   list.sort(function(a,b){ if(b.level !== a.level) return b.level - a.level; return b.score - a.score; });
   return list;
 }
@@ -876,7 +886,14 @@ function mergeRank(remote, tab){
   }
   var mine = localRankList(tab)[0];
   var has = false;
-  for(var i=0;i<remote.length;i++){ if(remote[i].name === state.name){ has = true; break; } }
+  for(var i=0;i<remote.length;i++){
+    if(remote[i].name === state.name){
+      has = true;
+      /* 我自己的头像以本机设置为准，避免云端旧行还是默认咪菇 */
+      if(state.avatar) remote[i].avatar = rankAvatar(state.avatar);
+      break;
+    }
+  }
   if(mine && !has) remote.push({ name: mine.name, avatar: mine.avatar, level: mine.level, score: mine.score });
   remote.sort(function(a,b){ if(b.level !== a.level) return b.level - a.level; return b.score - a.score; });
   return remote;
