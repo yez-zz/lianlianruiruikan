@@ -272,9 +272,13 @@ var state = null;
 function randomName(){
   return "爱瑞瑞" + (1000 + Math.floor(Math.random() * 9000));
 }
+function newUid(){
+  return "u" + Date.now().toString(36) + Math.random().toString(36).slice(2,8);
+}
 function defaultState(){
   return {
     name: randomName(),
+    uid: newUid(),
     avatar: DEFAULT_AVATAR,
     unlocked: 1,
     stars: {},
@@ -294,8 +298,15 @@ function loadState(){
     var o = JSON.parse(raw);
     var d = defaultState();
     for(var k in d){ if(!(k in o)) o[k] = d[k]; }
+    if(!o.uid) o.uid = newUid();
     if(!Array.isArray(o.records)) o.records = [];
     if(!Array.isArray(o.chRecords)) o.chRecords = [];
+    /* 老版本默认名都是同一个「爱瑞瑞」，导致所有人看起来都是同一人，这里迁移成随机名 */
+    if(o.name === "爱瑞瑞"){
+      o.name = randomName();
+      if(!o.aliases) o.aliases = [];
+      if(o.aliases.indexOf("爱瑞瑞") < 0) o.aliases.push("爱瑞瑞");
+    }
     return o;
   }catch(e){ return defaultState(); }
 }
@@ -557,10 +568,8 @@ function saveProfile(){
   saveState();
   refreshUserUI();
   closeModal();
-  /* 换头像/改名后，把现有最好成绩重发一次，让云端那行也换成新头像 */
-  var bn = localRankList("normal")[0], bc = localRankList("challenge")[0];
-  if(bn && bn.level >= 1) submitScore("normal", bn.level, bn.score);
-  if(bc && bc.level >= 1) submitScore("challenge", bc.level, bc.score);
+  /* 改名 / 换头像：直接改云端自己那一行，不再新增 */
+  syncProfile();
 }
 
 /* ---------------- 存档码 ---------------- */
@@ -665,25 +674,62 @@ function rankAvatar(av){
 
 function submitScore(mode, level, score){
   if(!level || level < 1) return;
-  var body = JSON.stringify([{ mode: mode, name: state.name, avatar: rankAvatar(state.avatar), level: level, score: score }]);
-  try{
-    sbReq("llr_scores?select=id", {
-      method: "POST",
-      body: body
-    }).catch(function(){
-      pushPending(body);
-    });
-  }catch(e){
-    pushPending(body);
+  var row = { mode: mode, uid: state.uid || "", name: state.name, avatar: rankAvatar(state.avatar), level: level, score: score };
+  var body = JSON.stringify(row);
+  var uid = state.uid;
+  if(!uid){
+    postScore(body);
+    return;
   }
+  var q = "uid=eq." + encodeURIComponent(uid) + "&select=id";
+  try{
+    sbReq("llr_scores?" + q, { method: "PATCH", body: JSON.stringify(row) })
+      .then(function(){
+        return sbReq("llr_scores?" + q);
+      })
+      .then(function(rows){
+        /* 云端还没有我这个 uid（比如被清库了），才插一条 */
+        if(!rows || !rows.length) postScore(body);
+      })
+      .catch(function(){ postScore(body); });
+  }catch(e){ postScore(body); }
 }
 
-function pushPending(body){
+function postScore(body){
+  try{
+    sbReq("llr_scores?select=id", { method: "POST", body: body })
+      .catch(function(){
+        /* 云端还没加 uid 列时退回老格式，保证成绩不丢 */
+        var row = {};
+        try{ row = JSON.parse(body); }catch(e){}
+        if(row && row.uid){
+          delete row.uid;
+          var plain = JSON.stringify(row);
+          sbReq("llr_scores?select=id", { method: "POST", body: plain })
+            .catch(function(){ pushPending("POST", plain); });
+        }else{
+          pushPending("POST", body);
+        }
+      });
+  }catch(e){ pushPending("POST", body); }
+}
+
+/* 改名 / 换头像：直接把云端自己那一行改掉 */
+function syncProfile(){
+  if(!state.uid) return;
+  var patch = JSON.stringify({ name: state.name, avatar: rankAvatar(state.avatar) });
+  try{
+    sbReq("llr_scores?uid=eq." + encodeURIComponent(state.uid), { method: "PATCH", body: patch })
+      .catch(function(){ pushPending("PATCH", patch, state.uid); });
+  }catch(e){ pushPending("PATCH", patch, state.uid); }
+}
+
+function pushPending(op, body, uidOverride){
   try{
     var q = [];
     try{ q = JSON.parse(localStorage.getItem("llr_pending") || "[]") || []; }catch(e){ q = []; }
     if(q.length > 20) q = q.slice(q.length - 20);
-    q.push(body);
+    q.push({ op: op || "POST", body: body, uid: uidOverride || (state && state.uid) || "" });
     localStorage.setItem("llr_pending", JSON.stringify(q));
   }catch(e){}
 }
@@ -694,34 +740,64 @@ function flushPending(){
     try{ q = JSON.parse(localStorage.getItem("llr_pending") || "[]") || []; }catch(e){ q = []; }
     if(!q.length) return;
     localStorage.setItem("llr_pending", "[]");
-    q.forEach(function(body){
+    q.forEach(function(item){
       try{
-        sbReq("llr_scores?select=id", { method: "POST", body: body }).catch(function(){ pushPending(body); });
-      }catch(e){ pushPending(body); }
+        if(item && item.op === "PATCH"){
+          var uid = item.uid || (state && state.uid) || "";
+          if(!uid) return;
+          sbReq("llr_scores?uid=eq." + encodeURIComponent(uid), { method: "PATCH", body: item.body })
+            .catch(function(){ pushPending("PATCH", item.body, uid); });
+        }else{
+          var body = (item && item.body) ? item.body : item;
+          sbReq("llr_scores?select=id", { method: "POST", body: body })
+            .catch(function(){ pushPending("POST", body); });
+        }
+      }catch(e){}
     });
   }catch(e){}
 }
 
 function fetchScores(mode, cb){
+  var full = "llr_scores?mode=eq." + mode + "&select=name,avatar,level,score,uid&order=level.desc,score.desc&limit=200";
+  var plain = "llr_scores?mode=eq." + mode + "&select=name,avatar,level,score&order=level.desc,score.desc&limit=200";
   try{
-    sbReq("llr_scores?mode=eq." + mode + "&select=name,avatar,level,score&order=level.desc,score.desc&limit=200")
+    sbReq(full)
       .then(function(rows){ cb(null, rows || []); })
-      .catch(function(e){ cb(e || new Error("net")); });
+      .catch(function(){
+        /* 云端还没有 uid 列时退回老字段，榜单照样能看 */
+        sbReq(plain)
+          .then(function(rows){ cb(null, rows || []); })
+          .catch(function(e){ cb(e || new Error("net")); });
+      });
   }catch(e){ cb(e); }
 }
 
 function dedupeScores(rows){
   var map = {}, out = [];
   for(var i=0;i<rows.length;i++){
-    var r = rows[i], k = String(r.name || "").trim();
-    if(!k) continue;
-    if(!map[k]){ map[k] = { name:k, avatar:r.avatar, level:r.level, score:r.score }; out.push(map[k]); }
+    var r = rows[i];
+    var uid = String(r.uid || "").trim();
+    var nm = String(r.name || "").trim();
+    var k = uid ? ("U#" + uid) : ("N#" + nm);
+    if(!nm) continue;
+    if(!map[k]){ map[k] = { name:nm, uid:uid, avatar:r.avatar, level:r.level, score:r.score }; out.push(map[k]); }
     else if(r.level > map[k].level || (r.level === map[k].level && r.score > map[k].score)){
       map[k].level = r.level; map[k].score = r.score; map[k].avatar = r.avatar;
     }
   }
-  out.sort(function(a,b){ if(b.level !== a.level) return b.level - a.level; return b.score - a.score; });
-  return out;
+  /* 老数据没有 uid：用同一张自定义头像猜同一个人（新数据有 uid，不会再误合并） */
+  var byAv = {}, out2 = [];
+  for(var i=0;i<out.length;i++){
+    var it = out[i], av = String(it.avatar || "");
+    if(it.uid || av.indexOf("data:") !== 0 || av.length < 300){ out2.push(it); continue; }
+    var prev = byAv[av];
+    if(!prev){ byAv[av] = it; out2.push(it); }
+    else if(it.level > prev.level || (it.level === prev.level && it.score > prev.score)){
+      prev.level = it.level; prev.score = it.score; prev.name = it.name;
+    }
+  }
+  out2.sort(function(a,b){ if(b.level !== a.level) return b.level - a.level; return b.score - a.score; });
+  return out2;
 }
 
 function recordResult(level, score, timeUsed){
@@ -865,37 +941,45 @@ function localRankList(tab){
 }
 
 function mergeRank(remote, tab){
-  /* 1) 曾用名的线上成绩统一改成当前名字 */
   var al = (state.aliases || []);
+  var myUid = state.uid || "";
+  /* 1) 我的历史行（同 uid 或曾用名）统一改成当前名字，统一挂到我的 uid 上 */
   for(var i=0;i<remote.length;i++){
-    if(remote[i].name !== state.name && al.indexOf(remote[i].name) >= 0) remote[i].name = state.name;
+    var r = remote[i];
+    if(myUid && r.uid === myUid){ r.name = state.name; }
+    else if(!r.uid && al.indexOf(r.name) >= 0){ r.name = state.name; r.uid = myUid; }
   }
-  /* 2) 同名（含改名后重合的）只留最好的一条 */
+  /* 2) 同一个人（同 uid）只留最好的一条 */
   var map = {}, out = [];
   for(var i=0;i<remote.length;i++){
-    var r = remote[i], k = String(r.name || "").trim();
-    if(!k) continue;
-    if(!map[k]){ map[k] = { name:k, avatar:r.avatar, level:r.level, score:r.score }; out.push(map[k]); }
-    else{
-      var keep = map[k];
-      if(r.level > keep.level || (r.level === keep.level && r.score > keep.score)){
-        keep.level = r.level; keep.score = r.score;
-        if(r.avatar) keep.avatar = r.avatar;
-      }
+    var r = remote[i];
+    var nm = String(r.name || "").trim();
+    if(!nm) continue;
+    var uid = String(r.uid || "").trim();
+    var k = uid ? ("U#" + uid) : ("N#" + nm);
+    var keep = map[k];
+    if(!keep){ map[k] = { name:nm, uid:uid, avatar:r.avatar, level:r.level, score:r.score }; out.push(map[k]); }
+    else if(r.level > keep.level || (r.level === keep.level && r.score > keep.score)){
+      keep.level = r.level; keep.score = r.score; if(r.avatar) keep.avatar = r.avatar;
     }
   }
   remote = out;
-  /* 3) 我自己的头像以本机设置为准 */
+  /* 3) 我自己那一行：名字和头像都用本机的 */
   var mine = localRankList(tab)[0];
   var has = false;
   for(var i=0;i<remote.length;i++){
-    if(remote[i].name === state.name){
+    if(myUid && remote[i].uid === myUid){
       has = true;
+      remote[i].name = state.name;
       if(state.avatar) remote[i].avatar = rankAvatar(state.avatar);
+      /* 云端比我本地低时，用本地的 */
+      if(mine && (mine.level > remote[i].level || (mine.level === remote[i].level && mine.score > remote[i].score))){
+        remote[i].level = mine.level; remote[i].score = mine.score;
+      }
       break;
     }
   }
-  if(mine && !has) remote.push({ name: mine.name, avatar: mine.avatar, level: mine.level, score: mine.score });
+  if(mine && !has) remote.push({ name: mine.name, uid: myUid, avatar: mine.avatar, level: mine.level, score: mine.score });
   remote.sort(function(a,b){ if(b.level !== a.level) return b.level - a.level; return b.score - a.score; });
   return remote;
 }
@@ -923,7 +1007,7 @@ function renderRankList(tab, list, online, srcOverride, canRetry){
     for(var i=0;i<list.length;i++){
       var it = list[i];
       var noCls = (i === 0 ? "top1" : i === 1 ? "top2" : i === 2 ? "top3" : "");
-      var isMe = (it.name === state.name) || ((state.aliases || []).indexOf(it.name) >= 0);
+      var isMe = (it.name === state.name) || (state.uid && it.uid === state.uid) || ((state.aliases || []).indexOf(it.name) >= 0);
       var av;
       if(it.avatar && it.avatar.indexOf("emoji:") === 0){
         av = '<div class="avatar avatarEmoji">' + it.avatar.slice(6) + '</div>';
