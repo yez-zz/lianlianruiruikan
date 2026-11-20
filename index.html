@@ -780,6 +780,36 @@ function fetchScores(mode, cb){
   }catch(e){ cb(e); }
 }
 
+/* 同名记录：uid 相同或有一方没 uid，说明是同一个人，合并成一条；两个不同 uid 的同名玩家保持分开 */
+function collapseRows(list){
+  var groups = [], idx = {};
+  for(var i=0;i<list.length;i++){
+    var it = list[i], nm = String(it.name || "").trim();
+    if(!nm) continue;
+    if(!idx[nm]){ idx[nm] = [it]; groups.push(idx[nm]); }
+    else idx[nm].push(it);
+  }
+  var out = [];
+  for(var g=0;g<groups.length;g++){
+    var grp = groups[g];
+    var uids = {};
+    for(var j=0;j<grp.length;j++){ if(grp[j].uid) uids[grp[j].uid] = 1; }
+    var distinct = Object.keys(uids).length;
+    if(distinct > 1){ for(var j=0;j<grp.length;j++) out.push(grp[j]); continue; }
+    var best = grp[0];
+    for(var j=1;j<grp.length;j++){
+      var o = grp[j];
+      if(o.level > best.level || (o.level === best.level && o.score > best.score)){
+        best = { name:best.name, uid:best.uid || o.uid, avatar:o.avatar || best.avatar, level:o.level, score:o.score };
+      }
+      if(!best.uid && o.uid) best.uid = o.uid;
+    }
+    out.push(best);
+  }
+  out.sort(function(a,b){ if(b.level !== a.level) return b.level - a.level; return b.score - a.score; });
+  return out;
+}
+
 function dedupeScores(rows){
   var map = {}, out = [];
   for(var i=0;i<rows.length;i++){
@@ -804,8 +834,7 @@ function dedupeScores(rows){
       prev.level = it.level; prev.score = it.score; prev.name = it.name;
     }
   }
-  out2.sort(function(a,b){ if(b.level !== a.level) return b.level - a.level; return b.score - a.score; });
-  return out2;
+  return collapseRows(out2);
 }
 
 function recordResult(level, score, timeUsed){
@@ -988,8 +1017,7 @@ function mergeRank(remote, tab){
     }
   }
   if(mine && !has) remote.push({ name: state.name, uid: myUid, avatar: mine.avatar, level: mine.level, score: mine.score });
-  remote.sort(function(a,b){ if(b.level !== a.level) return b.level - a.level; return b.score - a.score; });
-  return remote;
+  return collapseRows(remote);
 }
 
 function renderRankLocal(tab, canRetry, errMsg, loading){
